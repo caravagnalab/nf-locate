@@ -62,8 +62,77 @@ workflow SOMATIC {
     CLAIRS(input_vc)
 }
 
+// Run only the LOCATE stages (CN inference + methylation taxonomy) from the outputs of an
+// earlier pipeline run, skipping alignment, variant calling, phasing and modkit. Useful to
+// (re)run / test LOCATE at full size without redoing the upstream steps.
+//   nextflow run main.nf --locate_only true --upstream_dir <results dir of a previous run> \
+//       --locate_samples 1395,1437 --outdir <DIR> --reftss_promoters <csv> [--test_chromosomes ...]
+// Reads, per sample and chromosome, the same files the full pipeline would have produced:
+//   modkit/<s>/{H1,H2}_{Tumor,Normal}_<s>_<chr>_methylation.bed.gz(.tbi)
+//   battenberg_phase/<s>/<s>_<chr>_battenberg.vcf.gz(.tbi)     (tumour phasing, per chromosome)
+//   longphase/<s>/<s>_<chr>_snp.vcf  (or longphase/<s>/Normal/... in older runs)   (normal phasing)
+workflow LOCATE_ONLY {
+    if (!params.upstream_dir)   { error "--upstream_dir is required with --locate_only" }
+    if (!params.locate_samples) { error "--locate_samples (comma-separated sample IDs) is required with --locate_only" }
+
+    up      = params.upstream_dir.toString()
+    samples = params.locate_samples.toString().split(',').collect { it.trim() }.findAll { it }
+    chroms  = (params.test_chromosomes ?: (1..22)).collect { 'chr' + it }   // numeric genome order
+
+    // one [meta, file, index] row per sample x chromosome
+    meth = { hap, typ ->
+        Channel.fromList(samples.collectMany { sm -> chroms.collect { ch ->
+            def stem = "${up}/modkit/${sm}/${hap}_${typ}_${sm}_${ch}_methylation.bed.gz"
+            [[sampleID: sm, chr: ch, type: typ], file(stem, checkIfExists: true), file(stem + '.tbi', checkIfExists: true)]
+        } })
+    }
+    bb_rows = samples.collectMany { sm -> chroms.collect { ch ->
+        def v = "${up}/battenberg_phase/${sm}/${sm}_${ch}_battenberg.vcf.gz"
+        [[sampleID: sm, chr: ch], file(v, checkIfExists: true), file(v + '.tbi', checkIfExists: true)]
+    } }
+    tumor_phased  = Channel.fromList(bb_rows)
+    // current pipeline publishes longphase/<s>/<file>; older runs used longphase/<s>/Normal/<file>
+    normal_phased = Channel.fromList(samples.collectMany { sm -> chroms.collect { ch ->
+        def flat   = file("${up}/longphase/${sm}/${sm}_${ch}_snp.vcf")
+        def nested = file("${up}/longphase/${sm}/Normal/${sm}_${ch}_snp.vcf")
+        def vcf    = flat.exists() ? flat : nested
+        if (!vcf.exists()) { error "normal LongPhase VCF not found: ${flat} (or ${nested})" }
+        [[sampleID: sm, chr: ch], vcf]
+    } })
+
+    // whole-genome tumour VCF per sample (chromosomes already in genome order; --naive concat)
+    battenberg_by_sample = Channel.fromList(samples.collect { sm ->
+        def rows = bb_rows.findAll { it[0].sampleID == sm }
+        [[sampleID: sm], rows.collect { it[1] }, rows.collect { it[2] }]
+    })
+    concat_vcf = BCFTOOLS_CONCAT(battenberg_by_sample)
+
+    centromere_bed = params.centromere_bed
+        ? file(params.centromere_bed, checkIfExists: true) : file("${projectDir}/assets/NO_FILE")
+    low_mappability_bed = params.low_mappability_bed
+        ? file(params.low_mappability_bed, checkIfExists: true) : file("${projectDir}/assets/NO_FILE")
+    reftss_promoters = params.run_methylation_taxonomy.toString() == 'true'
+        ? file(params.reftss_promoters, checkIfExists: true) : file("${projectDir}/assets/NO_FILE")
+    imprinted_genes = params.imprinted_genes
+        ? file(params.imprinted_genes, checkIfExists: true) : file("${projectDir}/assets/NO_FILE")
+
+    LOCATE_CN(concat_vcf.vcf, Channel.empty(), centromere_bed, low_mappability_bed)
+
+    LOCATE_METHYLATION(
+        meth.call('H1', 'Tumor'), meth.call('H2', 'Tumor'), meth.call('H1', 'Normal'), meth.call('H2', 'Normal'),
+        LOCATE_CN.out.purity_ploidy,
+        LOCATE_CN.out.cn_segments,
+        reftss_promoters,
+        imprinted_genes,
+        tumor_phased,
+        normal_phased
+    )
+}
+
 workflow {
-  if (params.somatic_only.toString() == 'true') {
+  if (params.locate_only.toString() == 'true') {
+    LOCATE_ONLY()
+  } else if (params.somatic_only.toString() == 'true') {
     SOMATIC()
   } else {
     // samplesheet validation
@@ -118,6 +187,29 @@ workflow {
     // (prepare-table from-vcf treats this as "no filter") if not provided.
     low_mappability_bed = params.low_mappability_bed
         ? file(params.low_mappability_bed, checkIfExists: true)
+        : file("${projectDir}/assets/NO_FILE")
+
+    // refTSS promoter reference for the classify-posterior/aggregate-promoters
+    // methylation taxonomy (params.run_methylation_taxonomy) -- every alternative
+    // promoter/TSS a gene has, not just its MANE canonical one. No vendored
+    // default (it's a per-genome-build reference); required (checkIfExists fails
+    // loudly on a null/missing path, same as ref_genome/ref_fai above) only when
+    // BOTH run_locate and run_methylation_taxonomy are enabled -- this block is
+    // evaluated unconditionally (same as centromere_bed/low_mappability_bed
+    // above), so without the run_locate guard this would demand a promoter
+    // reference even for runs that never call LOCATE_CN/LOCATE_METHYLATION at
+    // all (confirmed: this broke the plain `--shortread false` test run, which
+    // doesn't pass --run_locate).
+    run_taxonomy_requested = params.run_locate.toString() == 'true' && params.run_methylation_taxonomy.toString() == 'true'
+    reftss_promoters = run_taxonomy_requested
+        ? file(params.reftss_promoters, checkIfExists: true)
+        : file("${projectDir}/assets/NO_FILE")
+
+    // optional gene-list CSV/TXT (see `locate methylation build-imprinted-genes`)
+    // -- promoters for these genes are dropped from the aggregated output;
+    // NO_FILE disables the exclusion (output unfiltered).
+    imprinted_genes = params.imprinted_genes
+        ? file(params.imprinted_genes, checkIfExists: true)
         : file("${projectDir}/assets/NO_FILE")
 
     // chr channel
@@ -250,7 +342,7 @@ workflow {
         battenberg_by_sample = BATTENBERG_PHASE.out.vcf.map{ meta, v, idx ->
           [meta.subMap('sampleID'), meta.chr, v, idx]
         }.groupTuple().map{ meta, chrs, vcfs, idxs ->
-          def order = (0..<chrs.size()).sort{ a, b ->
+          def order = (0..<chrs.size()).toList().sort(false){ a, b ->
             def ca = chrs[a].isNumber() ? chrs[a].toInteger() : (1000 + chrs[a].hashCode())
             def cb = chrs[b].isNumber() ? chrs[b].toInteger() : (1000 + chrs[b].hashCode())
             ca <=> cb
@@ -378,7 +470,7 @@ workflow {
         battenberg_by_sample = BATTENBERG_PHASE.out.vcf.map{ meta, v, idx ->
           [meta.subMap('sampleID'), meta.chr, v, idx]
         }.groupTuple().map{ meta, chrs, vcfs, idxs ->
-          def order = (0..<chrs.size()).sort{ a, b ->
+          def order = (0..<chrs.size()).toList().sort(false){ a, b ->
             def ca = chrs[a].isNumber() ? chrs[a].toInteger() : (1000 + chrs[a].hashCode())
             def cb = chrs[b].isNumber() ? chrs[b].toInteger() : (1000 + chrs[b].hashCode())
             ca <=> cb
@@ -394,7 +486,13 @@ workflow {
           METYLATION_HAPLOTYPE_T.out.meth_h1,
           METYLATION_HAPLOTYPE_T.out.meth_h2,
           METYLATION_HAPLOTYPE_N.out.meth_h1,
-          METYLATION_HAPLOTYPE_N.out.meth_h2
+          METYLATION_HAPLOTYPE_N.out.meth_h2,
+          LOCATE_CN.out.purity_ploidy,
+          LOCATE_CN.out.cn_segments,
+          reftss_promoters,
+          imprinted_genes,
+          BATTENBERG_PHASE.out.vcf,
+          LONGPHASE.out.vcf
         )
       }
     }
